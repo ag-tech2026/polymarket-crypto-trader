@@ -1,0 +1,5 @@
+data/logs/*.log
+data/trade-journal/*.csv
+data/data/
+__pycache__/
+*.pyc
