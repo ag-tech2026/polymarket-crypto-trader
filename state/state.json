@@ -1,0 +1,61 @@
+{
+  "config": {
+    "max_positions": 5,
+    "trade_size": 1.0,
+    "max_trade": 2.5,
+    "daily_loss_limit": 3.0,
+    "total_cap": 5.0,
+    "yes_buy_min": 0.05,
+    "yes_buy_max": 0.4,
+    "no_buy_min": 0.05,
+    "no_buy_max": 0.15,
+    "take_profit_roi": 0.8,
+    "stop_loss_pct": 0.5,
+    "min_liquidity": 200000,
+    "min_volume": 100000,
+    "scopes": [
+      "crypto"
+    ],
+    "auto_compound": true,
+    "profit_step": 0.25,
+    "loss_step": 0.25,
+    "compounding_every": 3.0
+  },
+  "positions": {
+    "will-ethereum-reach-8000-by-december-31-2026": {
+      "outcome": "Yes",
+      "price": 0.05,
+      "amount": 1.0,
+      "added": "2026-03-31T16:42:27.838474"
+    },
+    "bitcoin-above-72k-on-april-3": {
+      "outcome": "Yes",
+      "price": 0.05,
+      "amount": 1.0,
+      "added": "2026-03-31T16:42:27.838742"
+    },
+    "predictfun-fdv-above-2b-one-day-after-launch": {
+      "outcome": "Yes",
+      "price": 0.0525,
+      "amount": 1.0,
+      "added": "2026-03-31T16:42:27.839067"
+    },
+    "bitcoin-above-70k-on-april-1": {
+      "outcome": "Yes",
+      "price": 0.053,
+      "amount": 1.0,
+      "added": "2026-03-31T16:42:27.873709"
+    },
+    "will-solana-reach-600-by-december-31-2026": {
+      "outcome": "Yes",
+      "price": 0.055,
+      "amount": 1.0,
+      "added": "2026-03-31T16:42:27.915792"
+    }
+  },
+  "journal": [],
+  "daily_pnl": 0.0,
+  "total_pnl": 0.0,
+  "runs": 1,
+  "last_run": "2026-03-31T16:42:27.916704"
+}
