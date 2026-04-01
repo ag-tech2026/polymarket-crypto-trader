@@ -31,12 +31,14 @@ def log(m, lv="INFO"):
 
 def telegram_alert(msg):
     """Send a Telegram alert."""
+    if not CFG.get("telegram_alerts", True):
+        return
+    token = "8790751627:AAFytj-a3W3OegqSsYNAtjIVenTHKFfR55s"
+    chat_id = "7372567737"
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = f"chat_id={chat_id}&text={msg}&parse_mode=HTML"
     try:
-        import os
-        token = os.environ.get("TELEGRAM_BOT_TOKEN", "8790751627:AAFytj-a3W3OegqSsYNAtjIVenTHKFfR55s")
-        chat_id = "7372567737"
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        subprocess.run(["curl", "-s", url, "-d", f"chat_id={chat_id}&text={msg}"],
+        subprocess.run(["curl", "-s", "-X", "POST", url, "-d", payload],
                        capture_output=True, text=True, timeout=5)
     except:
         pass
@@ -170,13 +172,31 @@ def run(dry=True):
                         try: rp.append(dict(r=l, pnl=float(x.replace("%","")))); break
                         except: pass
     
+    def _match_pos(slug, text):
+      import re as _re
+      text_clean = text.lower()
+      text_clean = _re.sub(r"[$,\.]", "", text_clean)
+      slug_parts = slug.replace("-"," ").split()
+      sig = [w for w in slug_parts if len(w)>2 and w not in ("will","the","and","for","with","reach","above","below","after","before","between","december","november","october","september","january","february","by")]
+      if not sig:
+        return False
+      words_found = 0
+      for w in sig:
+        if w in text_clean or (w.isdigit() and len(w)>3 and str(int(w)) in text_clean):
+          words_found += 1
+      # Threshold: 2 for short slugs (3-6 sig words), 3 for longer ones
+      # This handles Bullpen's ~40-char truncation cutting off year endings
+      needed = min(3, max(2, (len(sig) + 1) // 3))
+      return words_found >= needed
+
+
     for sl in list(s["pos"].keys()):
         info=s["pos"][sl]; entry=info["p"]*info["a"]
         match=None
         for x in rp:
-            if sl in x["r"]: match=x; break
+            if _match_pos(sl, x["r"]): match=x; break
         if not match:
-            log(f"Pending: {sl[:30]}"); continue
+            log(f"⏳ Pending (unmatched): {sl[:40]}"); continue
             
         pnl=(entry*(1+match["pnl"]/100))-entry; roi=pnl/entry if entry>0 else 0
         
@@ -310,8 +330,8 @@ def run(dry=True):
                 filled += 1
                 cat_counts[cat] = cat_counts.get(cat, 0) + 1
         else:
-            s["pos"][m["s"]]=dict(o=m["o"],p=m["p"],a=a, **{k:v for k,v in meta.items() if v})
-            jlog("open",m["s"],0, **{k:v for k,v in meta.items() if v})
+            # DRY: log opportunity but don't persist to state (prevents zombie positions)
+            jlog("dry_open",m["s"],0, **{k:v for k,v in meta.items() if v})
             log(f"✅ DRY {m['o']}@{m['p']:.0%} ${a:.2f} → {q_short}")
             filled += 1
             cat_counts[cat] = cat_counts.get(cat, 0) + 1
