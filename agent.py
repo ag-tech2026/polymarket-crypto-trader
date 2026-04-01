@@ -1,412 +1,202 @@
 #!/usr/bin/env python3
-"""
-Polymarket Autonomous Agent — complete trading lifecycle manager.
-
-Research → Score → Buy → Monitor → Exit → Journal → Improve
-Auto-compounding, multi-strategy, position exit management.
-"""
-
-import json
-import os
-import subprocess
-import sys
-import time
+"""Polymarket Autonomous Agent v3 — self-tuning, zero manual edits."""
+import json, os, subprocess, sys, time
 from datetime import datetime
 from pathlib import Path
 
-# ─── Paths ───────────────────────────────────────────────────────
-REPO  = Path(__file__).resolve().parent
-STATE = REPO / "state"
-LOGS  = REPO / "data" / "logs"
-JOURN = REPO / "data" / "journals"
-for d in [STATE, LOGS, JOURN]:
-    d.mkdir(parents=True, exist_ok=True)
+ROOT = Path(__file__).resolve().parent
+STATE = ROOT / "state"
+LOGS  = ROOT / "data/logs"
+JOURN = ROOT / "data/journals"
+for d in [STATE, LOGS, JOURN]: d.mkdir(parents=True, exist_ok=True)
 
-# ─── Log Rotation ─────────────────────────────────────────────────
-def rotate_logs():
-    """Delete logs older than 7 days, cap journal at 500 entries."""
-    now = time.time()
-    for f in LOGS.glob("*"):
-        if f.is_file() and now - f.stat().st_mtime > 7 * 86400:  # 7d
-            f.unlink()
-    # Cap journal
-    jf = JOURN / "strategy_journal.json"
-    if jf.exists():
-        try:
-            lst = json.loads(jf.read_text())
-            if len(lst) > 500:
-                lst = lst[-300:]  # keep last 300
-                jf.write_text(json.dumps(lst, indent=2))
-        except:
-            pass
+SFILE = STATE / "state.json"
+JFILE = JOURN / "strategy_journal.json"
 
-
-# ─── Default Config ─────────────────────────────────────────────
-DEFAULT = dict(
-    max_positions       = 5,
-    trade_size          = 1.00,
-    max_trade           = 2.50,
-    daily_loss_limit    = 3.00,
-    total_cap           = 5.00,
-    yes_buy_min         = 0.05,
-    yes_buy_max         = 0.40,
-    no_buy_min          = 0.05,
-    no_buy_max          = 0.15,
-    take_profit_roi     = 0.80,
-    stop_loss_pct       = 0.50,
-    min_liquidity       = 200000,
-    min_volume          = 100000,
-    scopes              = ["crypto"],
-    auto_compound       = True,
-    profit_step         = 0.25,
-    loss_step           = 0.25,
-    compounding_every   = 3.00,
+# Default config
+CFG = dict(
+    max_pos=5, trade=1.0, max_trade=2.5, min_trade=0.5,
+    daily_lim=3.0, cap=2.0, yes_min=0.05, yes_max=0.40,
+    tp_roi=0.80, sl_pct=0.50, tune_every=10, last_tune_run=0
 )
 
+def log(m, lv="INFO"):
+    ts = time.strftime("%H:%M:%S")
+    print(f"[{ts}] [{lv}] {m}")
+    with open(LOGS / f"agent_{time.strftime('%Y-%m-%d')}.log", "a") as f:
+        f.write(f"[{ts}] [{lv}] {m}\n")
 
-def log(msg, level="INFO"):
-    ts = datetime.now().strftime("%H:%M:%S")
-    print(f"[{ts}] [{level}] {msg}")
-    with open(LOGS / f"agent_{datetime.now():%Y-%m-%d}.log", "a") as f:
-        f.write(f"[{ts}] [{level}] {msg}\n")
+def bp(a, t=30):
+    r=subprocess.run(["bullpen","polymarket"]+a, capture_output=True, text=True, timeout=t)
+    if r.returncode!=0: return None, r.stderr[:300]
+    try: return json.loads(r.stdout), None
+    except: return r.stdout.strip(), None
 
-
-# ─── State ──────────────────────────────────────────────────────
-SFILE = STATE / "state.json"
-
-def load_state():
+def load():
     if SFILE.exists():
         try:
-            s = json.loads(SFILE.read_text())
+            raw=json.loads(SFILE.read_text())
+            # Map old keys to new schema
+            s={}
+            for k,v in CFG.items(): s[k]=raw.get(k,v)
+            
+            # Convert positions: old "outcome"/"price"/"amount" → new "o"/"p"/"a"
+            raw_pos=raw.get("positions",raw.get("pos",{}))
+            s_pos={}
+            for sl,info in raw_pos.items():
+                if "o" in info:
+                    s_pos[sl]=info
+                else:
+                    s_pos[sl]=dict(
+                        o=info.get("outcome","Yes"),
+                        p=info.get("price",0.5),
+                        a=info.get("amount",1.0),
+                    )
+            s["pos"]=s_pos
+            
+            s["runs"]=raw.get("runs",raw.get("cnt",0))
+            s["t_pnl"]=raw.get("total_pnl",raw.get("t_pnl",0.0))
+            s["d_pnl"]=raw.get("daily_pnl",raw.get("d_pnl",0.0))
+            s["lr"]=raw.get("last_run",raw.get("lr",""))
             return s
-        except:
-            pass
-    return dict(
-        config     = DEFAULT.copy(),
-        positions  = {},    # slug → {outcome, price, amount, added}
-        journal    = [],    # [{date, type, result, pnl}]
-        daily_pnl  = 0.0,
-        total_pnl  = 0.0,
-        runs       = 0,
-    )
+        except: pass
+    return {**CFG, "pos":{}, "runs":0, "t_pnl":0.0, "d_pnl":0.0, "lr":""}
 
-def save_state(s):
-    s["last_run"] = datetime.now().isoformat()
-    SFILE.write_text(json.dumps(s, indent=2))
+def save(s):
+    s["lr"]=time.strftime("%Y-%m-%dT%H:%M:%S")
+    SFILE.write_text(json.dumps(s,indent=2))
 
+def jlog(t,s,p):
+    l=json.loads(JFILE.read_text()) if JFILE.exists() else []
+    l.append(dict(d=datetime.now().isoformat(), t=t, s=s, p=round(p,2)))
+    if len(l)>600: l=l[-300:]
+    JFILE.write_text(json.dumps(l,indent=2))
 
-# ─── Bullpen CLI ────────────────────────────────────────────────
-def bp(args, timeout=30):
-    cmd = ["bullpen", "polymarket"] + args
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        if r.returncode != 0:
-            return None, r.stderr.strip()[:300]
-        try:
-            return json.loads(r.stdout), None
-        except:
-            return r.stdout.strip(), None
-    except Exception as e:
-        return None, str(e)
+def sz(s):
+    p=s["t_pnl"]
+    if p>=0: return round(min(s["max_trade"], s["trade"]+int(abs(p)/3)*0.15),2)
+    return round(max(s["min_trade"], s["trade"]-int(abs(p)/3)*0.15),2)
 
+def tune(s):
+    """Auto-tune YES buy zone based on journal history."""
+    if not JFILE.exists(): return
+    jl=json.loads(JFILE.read_text())
+    cl=[x for x in jl if x["t"] in("tp","sl")]
+    if len(cl)<5: return
+    if s["runs"]-s.get("last_tune_run",0)<s.get("tune_every",10): return
+    
+    recent=cl[-50:]; wins=sum(1 for x in recent if x["t"]=="tp")
+    n=len(recent); wr=wins/n if n else 0.5; ch=False
+    
+    if wr>=0.60:
+        s["yes_max"]=round(min(0.55,s.get("yes_max",0.40)+0.05),2)
+        log(f"🎯 WinRate({wr:.0%}): Widening YES to {s['yes_max']:.0%}"); ch=True
+    elif wr<0.40:
+        s["yes_max"]=round(max(0.10,s.get("yes_max",0.40)-0.05),2)
+        log(f"📉 WinRate({wr:.0%}): Tightening YES to {s['yes_max']:.0%}"); ch=True
+        
+    if ch: s["last_tune_run"]=s["runs"]
 
-# ─── Safety ─────────────────────────────────────────────────────
-def check_balance(s):
-    cap = s["config"]["total_cap"]
-    d, e = bp(["clob", "balance"])
-    if e:
-        log(f"⚠️ balance: {e}", "WARN")
-        return False
-    t = d if isinstance(d, str) else ""
-    bal = 0.0
-    for ln in t.split("\n"):
-        if "Balance:" in ln:
-            try:
-                bal = float(ln.split("$")[1].split(",")[0])
-            except:
-                pass
-    if bal <= 0:
-        log(f"🛑 Balance ${bal:.2f}", "CRIT");
-        return False
-    if bal < cap:
-        log(f"** Balance ${bal:.2f} below ${cap:.2f}", "WARN")
-    log(f"💰 ${bal:.2f} | Daily ${s['daily_pnl']:+.2f} | Tot ${s['total_pnl']:+.2f}")
-    if s["daily_pnl"] <= -s["config"]["daily_loss_limit"]:
-        log(f"🛑 daily loss hit", "CRIT")
-        return False
-    return True
-
-
-# ─── Real Polymarket Positions ──────────────────────────────────
-def fetch_positions():
-    d, e = bp(["positions"])
-    if e or not d:
-        return []
-    t = d if isinstance(d, str) else ""
-    if "No active" in t or "Portfolio Value: $0.00" in t:
-        return []
-    lst = []
-    for ln in t.split("\n"):
-        ln = ln.strip()
-        if not ln or ln.startswith(("Showing", "Portfolio", "Market", "—")):
-            continue
-        if "$" in ln and "%" in ln:
-            parts = ln.split()
-            pnl = 0.0
-            for p in parts:
-                if "%" in p:
-                    try:
-                        pnl = float(p.replace("%", ""))
-                    except:
-                        pass
-            lst.append(dict(
-                raw   = ln,
-                mkt   = parts[0] if parts else "",
-                pnl   = pnl,
-            ))
-    return lst
-
-
-# ─── Discover ───────────────────────────────────────────────────
-def discover(scopes):
-    """Return flat list of market dicts."""
-    all_m = []
-    for sc in scopes:
-        d, e = bp(["discover", sc, "--min-liquidity", "200000",
-                   "--min-volume", "100000", "--sort", "volume",
-                   "--limit", "50", "--output", "json"])
-        if e:
-            log(f"⚠ {sc}: {e}", "WARN")
-            continue
-        if isinstance(d, str):
-            try:
-                d = json.loads(d)
-            except:
-                continue
-        for ev in d.get("events", []):
-            for mkt in ev.get("markets", []):
-                if mkt.get("closed") or mkt.get("resolved"):
-                    continue
-                all_m.append(dict(
-                    slug   = mkt.get("slug", ""),
-                    q      = mkt.get("question", ""),
-                    end    = ev.get("end_date", ""),
-                    vol    = mkt.get("volume_24h", 0),
-                    liq    = mkt.get("liquidity", 0),
-                    outs   = mkt.get("outcomes", []),
-                ))
-    return all_m
-
-
-# ─── Score ──────────────────────────────────────────────────────
-def score(m, cfg):
-    """Return list of {slug,q,outcome,price,roi, strat}."""
-    o = m["outs"]
-    if len(o) < 2:
-        return []
-    yp = o[0].get("price") or 0
-    np_ = o[1].get("price") or 0
-    if not yp or not np_:
-        return []
-    r = []
-    # YES value
-    if cfg["yes_buy_min"] <= yp <= cfg["yes_buy_max"]:
-        r.append(dict(
-            slug   = m["slug"], q   = m["q"],
-            end    = m["end"][:10] if m["end"] else "TBD",
-            strat  = "yes_val",
-            outcome = "Yes", price = yp,
-            roi    = round((1 - yp) / yp, 2),
-        ))
-    # NO hedge  (YES ≥ 85% → NO ≤ 15%)
-    if yp >= 0.85 and cfg["no_buy_min"] <= np_ <= cfg["no_buy_max"]:
-        r.append(dict(
-            slug   = m["slug"], q   = m["q"],
-            end    = m["end"][:10] if m["end"] else "TBD",
-            strat  = "no_hedge",
-            outcome = "No", price = np_,
-            roi    = round((1 - np_) / np_, 2),
-        ))
-    return r
-
-
-# ─── Trade ──────────────────────────────────────────────────────
-def buy(slug, outcome, amt, dry):
-    if dry:
-        return True, "dry"
-    d, e = bp(["buy", slug, outcome, f"{amt:.2f}", "--yes", "--output", "json"])
-    if e:
-        return False, e
-    oid = ""
-    if isinstance(d, dict):
-        oid = d.get("order_id") or d.get("id") or "ok"
-    return True, oid
-
-
-def sell(slug, outcome, amt, dry):
-    if dry:
-        return True, "dry"
-    d, e = bp(["sell", slug, outcome, f"{amt:.2f}", "--yes", "--output", "json"])
-    if e:
-        return False, e
-    return True, "sold"
-
-
-# ─── Size ───────────────────────────────────────────────────────
-def calc_size(s):
-    c = s["config"]
-    if not c["auto_compound"]:
-        return round(min(c["trade_size"], c["max_trade"]), 2)
-    p = s["total_pnl"]
-    base = c["trade_size"]
-    step = c["profit_step"] if p >= 0 else -c["loss_step"]
-    n = int(abs(p) // c["compounding_every"]) if c["compounding_every"] else 0
-    sz = base + n * step if p >= 0 else base - n * c["loss_step"]
-    return round(max(0.50, min(sz, c["max_trade"])), 2)
-
-
-# ─── Exits ──────────────────────────────────────────────────────
-def manage_exits(s, dry):
-    c  = s["config"]
-    ps = s.get("positions", {})
-    if not ps:
-        return
-    real = fetch_positions()
-    closed = 0
-    for slug in list(ps.keys()):
-        info = ps[slug]
-        entry_cost = info["price"] * info["amount"]
-        # Find matching real position by slug substring
-        match = None
-        for rp in real:
-            if slug in rp.get("raw", "") or slug in rp.get("mkt", ""):
-                match = rp
-                break
-        if not match:
-            log(f"⏳ pending? → {slug[:50]}", "INFO")
-            continue
-        pnl_pct = match["pnl"] / 100
-        current_value = entry_cost * (1 + pnl_pct)
-        pnl_d   = current_value - entry_cost
-        roi     = pnl_d / entry_cost if entry_cost > 0 else 0
-
-        # Take profit
-        if roi >= c["take_profit_roi"]:
-            log(f"💰 TP → {slug[:50]} ROI {roi:.0%} (${pnl_d:+.2f})")
-            ok, m = sell(slug, info["outcome"], info["amount"], dry)
-            if ok:
-                s["total_pnl"] += pnl_d
-                s["daily_pnl"] += pnl_d
-                jlog(s, "sell_profit", slug, pnl_d)
-                del ps[slug]
-                closed += 1
-            continue
-
-        # Stop loss
-        if roi <= -c["stop_loss_pct"]:
-            log(f"🛑 SL → {slug[:50]} ROI {roi:.0%} (${pnl_d:+.2f})")
-            ok, m = sell(slug, info["outcome"], info["amount"], dry)
-            if ok:
-                s["total_pnl"] += pnl_d
-                s["daily_pnl"] += pnl_d
-                jlog(s, "sell_loss", slug, pnl_d)
-                del ps[slug]
-                closed += 1
-            continue
-
-    if closed:
-        log(f"🧹 closed {closed}")
-
-
-# ─── Journal ─────────────────────────────────────────────────────
-def jlog(s, kind, slug, pnl=0.0):
-    JOURN.mkdir(parents=True, exist_ok=True)
-    jfile = JOURN / "strategy_journal.json"
-    rec = dict(
-        date  = datetime.now().isoformat(),
-        slug  = slug,
-        type  = kind,
-        pnl   = round(pnl, 2),
-    )
-    lst = []
-    if jfile.exists():
-        try:
-            lst = json.loads(jfile.read_text())
-        except:
-            pass
-    lst.append(rec)
-    jfile.write_text(json.dumps(lst, indent=2))
-
-
-# ─── The Agent ─────────────────────────────────────────────────────
 def run(dry=True):
-    # 0. Clean up old logs / journal
-    rotate_logs()
+    mode="LIVE" if not dry else "DRY"
+    s=load(); s["runs"]+=1; c=s
+    size=sz(s)
+    log("="*60); log(f"[{mode}] #{s['runs']} sz:${size:.2f} YES<={c['yes_max']:.0%}")
+    
+    # 1. Safety Check
+    bal=None; d,e=bp(["clob","balance"])
+    if not e and str(d).strip():
+        for l in str(d).split("\n"):
+            if "Balance:" in l:
+                try: bal=float(l.split("$")[1].split(",")[0]); break
+                except: pass
+    if bal is not None:
+        log(f"💰${bal:.2f} | Day:${s['d_pnl']:+.2f} | Tot:${s['t_pnl']:+.2f}")
+        if bal<c["cap"]: log("🛑 Balance below cap","CRIT"); save(s); return
+        if s["d_pnl"]<=-c["daily_lim"]: log("🛑 Daily limit hit","CRIT"); save(s); return
+    else: log("⚠️ Balance check failed"); save(s); return
 
-    mode = "DRY" if dry else "LIVE"
-    s    = load_state()
-    c    = s["config"]
-    sz   = calc_size(s)
+    # 2. Manage Exits
+    rp=[]; d2,e2=bp(["positions"])
+    if not e2 and str(d2).strip():
+        for l in str(d2).split("\n"):
+            if "$" in l and "%" in l:
+                for x in reversed(l.split()):
+                    if "%" in x:
+                        try: rp.append(dict(r=l, pnl=float(x.replace("%","")))); break
+                        except: pass
+    
+    for sl in list(s["pos"].keys()):
+        info=s["pos"][sl]; entry=info["p"]*info["a"]
+        match=None
+        for x in rp:
+            if sl in x["r"]: match=x; break
+        if not match:
+            log(f"Pending: {sl[:30]}"); continue
+            
+        pnl=(entry*(1+match["pnl"]/100))-entry; roi=pnl/entry if entry>0 else 0
+        
+        if roi>=c["tp_roi"]:
+            if not dry: bp(["sell",sl,info["o"],f"{info['a']:.2f}","--yes"])
+            s["t_pnl"]+=pnl; s["d_pnl"]+=pnl; jlog("tp",sl,pnl); s["pos"].pop(sl)
+            log(f"💰 TP: {sl[:30]} ROI={roi:.0%} ${pnl:+.2f}")
+        elif roi<=-c["sl_pct"]:
+            if not dry: bp(["sell",sl,info["o"],f"{info['a']:.2f}","--yes"])
+            s["t_pnl"]+=pnl; s["d_pnl"]+=pnl; jlog("sl",sl,pnl); s["pos"].pop(sl)
+            log(f"🛑 SL: {sl[:30]} ROI={roi:.0%} ${pnl:+.2f}")
 
-    log("=" * 70)
-    log(f"POLY AUTONOMOUS AGENT [{mode}]")
-    log(f"Run #{s['runs']+1}  {datetime.now():%Y-%m-%d %H:%M}  size~${sz:.2f}")
+    # 3. Self-Tune
+    tune(s)
 
-    # 1. Safety
-    if not check_balance(s):
-        save_state(s); return
-
-    # 2. Exit positions
-    manage_exits(s, dry)
-
-    # 3. Discover
-    mkts = discover(c["scopes"])
-    log(f"🔍 {len(mkts)} markets")
-
-    # 4. Score
-    all_o = []
-    for m in mkts:
-        all_o.extend(score(m, c))
-    all_o.sort(key=lambda x: -x["roi"])
-
-    exist = set(s.get("positions", {}).keys())
-    avail = [o for o in all_o if o["slug"] not in exist]
-
-    log(f"🎯 {len(avail)} new ({sz} avail)")
-    for i, o in enumerate(avail[:8], 1):
-        log(f"  {i}. B {o['outcome']}@{o['price']:.0%} {o['roi']}x {o['q'][:60]}...")
-
+    # 4. Discover & Score
+    mkts=[]
+    scopes = ["crypto"]
+    for sc in scopes:
+        d,e=bp(["discover",sc,"--min-liquidity","100000","--sort","volume","--limit","40","--output","json"])
+        if e: continue
+        if isinstance(d,str):
+            try: d=json.loads(d)
+            except: continue
+        for ev in d.get("events",[]):
+            for mk in ev.get("markets",[]):
+                if mk.get("closed"): continue
+                outs=mk.get("outcomes",[])
+                if len(outs)<2: continue
+                yp=outs[0].get("price") or 0; np_=outs[1].get("price") or 0
+                if not yp or not np_: continue
+                
+                if c["yes_min"]<=yp<=c["yes_max"]:
+                    roi=round((1-yp)/yp,2); mkts.append(dict(s=mk["slug"],o="Yes",p=yp,r=roi,q=mk.get("question","")))
+                elif yp>=0.85 and 0.05<=np_<=0.20:
+                    roi=round((1-np_)/np_,2); mkts.append(dict(s=mk["slug"],o="No",p=np_,r=roi,q=mk.get("question","")))
+    
+    mkts.sort(key=lambda x:-x["r"])
+    ex=set(s["pos"].keys())
+    av=[m for m in mkts if m["s"] not in ex]
+    log(f"👁️ Scanned {len(mkts)}, Found {len(av)} opportunities")
+    
     # 5. Execute
-    n = len(s.get("positions", {}))
-    slots = c["max_positions"] - n
-    filled = 0
-    for o in avail[:slots]:
-        slug = o["slug"]
-        ok, m = buy(slug, o["outcome"], sz, dry)
-        if ok:
-            s["positions"][slug] = dict(
-                outcome = o["outcome"],
-                price   = o["price"],
-                amount  = sz,
-                added   = datetime.now().isoformat(),
-            )
-            filled += 1
-            log(f"  ✅ {slug[:50]}")
-            jlog(s, "open", slug)
+    slots=c["max_pos"]-len(s["pos"])
+    for m in av[:slots]:
+        a=sz(s); q_short=m['q'][:30].replace('"','')
+        if not dry:
+            d_r,err=bp(["buy",m["s"],m["o"],f"{a:.2f}","--yes","--output","json"])
+            if err: 
+                log(f"❌ Buy failed: {err}","WARN")
+            else:
+                s["pos"][m["s"]]=dict(o=m["o"],p=m["p"],a=a)
+                jlog("open",m["s"],0)
+                log(f"✅ LIVE {m['o']}@{m['p']:.0%} ${a:.2f} → {q_short}")
         else:
-            log(f"  ❌ {slug[:40]}… {m}", "ERR")
+            s["pos"][m["s"]]=dict(o=m["o"],p=m["p"],a=a)
+            jlog("open",m["s"],0)
+            log(f"✅ DRY {m['o']}@{m['p']:.0%} ${a:.2f} → {q_short}")
+            
+    log(f"📊 {len(s['pos'])}/{c['max_pos']} pos | ${s['t_pnl']:+.2f}")
+    log("="*60); save(s)
 
-    s["runs"] += 1
-    log(f"📊 {n+filled}/{c['max_positions']} | PnL ${s['total_pnl']:+.2f}")
-    log("=" * 70)
-    save_state(s)
-
-
-def main():
-    args = sys.argv[1:]
-    dry  = "--live" not in args   # safety default
-    run(dry)
-
-
-if __name__ == "__main__":
-    main()
+if __name__=="__main__": 
+    if "--live" in sys.argv:
+        run(dry=False)
+    else:
+        run(dry=True)
