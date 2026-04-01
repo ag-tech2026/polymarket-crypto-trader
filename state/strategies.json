@@ -1,0 +1,43 @@
+{
+  "active": {
+    "name": "default",
+    "config": {
+      "yes_min": 0.05,
+      "yes_max": 0.4,
+      "max_pos": 5,
+      "trade_size": 1.0,
+      "tp_roi": 0.8,
+      "sl_pct": 0.5
+    },
+    "status": "active",
+    "since": "2026-04-01T00:36:56.232562",
+    "trades": 0,
+    "wins": 0,
+    "losses": 0,
+    "pnl": 0.0,
+    "win_rate": 0.0
+  },
+  "incubating": [
+    {
+      "name": "Aggressive (+more positions)",
+      "config": {
+        "yes_min": 0.05,
+        "yes_max": 0.4,
+        "no_min": 0.05,
+        "no_max": 0.15,
+        "max_pos": 8,
+        "trade_size": 1.0,
+        "tp_roi": 0.8,
+        "sl_pct": 0.5
+      },
+      "status": "incubating",
+      "started_at": "2026-04-01T00:36:58.402909",
+      "trades": 0,
+      "wins": 0,
+      "losses": 0,
+      "pnl": 0.0,
+      "win_rate": 0.0
+    }
+  ],
+  "history": []
+}

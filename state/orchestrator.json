@@ -1,0 +1,11 @@
+{
+  "total_runs": 1,
+  "last_research": 1,
+  "last_backtest": 1,
+  "last_incubate": 0,
+  "cycles_since_promotion": 0,
+  "promotions": [],
+  "rollbacks": [],
+  "phase": "trade",
+  "last_run_at": "2026-04-01T00:37:07.763832"
+}
