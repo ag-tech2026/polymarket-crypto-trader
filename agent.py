@@ -18,9 +18,11 @@ CFG = dict(
     max_pos=5, trade=1.0, max_trade=2.5, min_trade=0.5,
     daily_lim=3.0, cap=2.0, yes_min=0.05, yes_max=0.40,
     tp_roi=0.80, sl_pct=0.50, tune_every=10, last_tune_run=0,
-    fast_mode=False,                  # Tighter TP/SL for faster learning
-    max_per_category=2,               # Correlation limit per market category
-    telegram_alerts=True              # Send TP/SL alerts to Telegram
+    fast_mode=False,                        # Tighter TP/SL for faster learning
+    max_per_category=2,                     # Correlation limit per market category
+    telegram_alerts=True,                   # Send TP/SL alerts to Telegram
+    min_resolution_days=1,                  # Skip markets resolving before this
+    max_resolution_days=7,                  # Skip markets resolving after this
 )
 
 def log(m, lv="INFO"):
@@ -148,6 +150,11 @@ def run(dry=True):
         orig_tp=c["tp_roi"]; orig_sl=c["sl_pct"]
         c["tp_roi"]=0.50; c["sl_pct"]=0.30
         log(f"⚡ Fast mode: TP={c['tp_roi']:.0%} SL={c['sl_pct']:.0%}")
+    
+    # Resolution window filter (default: 1-7 days)
+    min_days = c.get("min_resolution_days", 1)
+    max_days = c.get("max_resolution_days", 7)
+    log(f"📅 Resolution window: {min_days}-{max_days}d from now")
     
     # 1. Safety Check
     bal=None; d,e=bp(["clob","balance"])
@@ -277,16 +284,46 @@ def run(dry=True):
                     pr="t1" if yp<=0.10 else "t2" if yp<=0.20 else "t3" if yp<=0.30 else "t4"
                     cat=_categorize(ev.get("title","")+mk.get("question",""))
                     ed=ev.get("end_date","")
+                    
+                    # Resolution timeframe filter
+                    days_to_res = None
+                    if ed:
+                        try:
+                            from datetime import datetime
+                            res_dt = datetime.strptime(ed[:10], "%Y-%m-%d")
+                            days_to_res = (res_dt - datetime.now()).days
+                        except: pass
+                    
+                    # Skip if outside resolution window
+                    if days_to_res is not None:
+                        if days_to_res < min_days or days_to_res > max_days:
+                            continue
+                    
                     mkts.append(dict(s=mk["slug"],o="Yes",p=yp,r=roi,q=mk.get("question",""),
                                      liq=mk.get("liquidity",0), vol=mk.get("volume_24h",0),
-                                     cat=cat, e=ed[:10] if ed else "TBD", pr=pr))
+                                     cat=cat, e=ed[:10] if ed else "TBD", pr=pr,
+                                     days_to_res=days_to_res))
                 elif yp>=0.85 and 0.05<=np_<=0.20:
                     roi=round((1-np_)/np_,2)
                     cat=_categorize(ev.get("title","")+mk.get("question",""))
                     ed=ev.get("end_date","")
+                    
+                    days_to_res = None
+                    if ed:
+                        try:
+                            from datetime import datetime
+                            res_dt = datetime.strptime(ed[:10], "%Y-%m-%d")
+                            days_to_res = (res_dt - datetime.now()).days
+                        except: pass
+                    
+                    if days_to_res is not None:
+                        if days_to_res < min_days or days_to_res > max_days:
+                            continue
+                    
                     mkts.append(dict(s=mk["slug"],o="No",p=np_,r=roi,q=mk.get("question",""),
                                      liq=mk.get("liquidity",0), vol=mk.get("volume_24h",0),
-                                     cat=cat, e=ed[:10] if ed else "TBD", pr="t1"))
+                                     cat=cat, e=ed[:10] if ed else "TBD", pr="t1",
+                                     days_to_res=days_to_res))
     
     mkts.sort(key=lambda x:-x["r"])
     

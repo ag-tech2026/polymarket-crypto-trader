@@ -208,20 +208,19 @@ def get_market_dynamics_score(market):
         score -= 2.0  # We don't trade expensive Yes positions
     
     # Time to resolution bonus
-    # Markets resolving soon = less exposure time, faster capital turnover
-    ed = market.get("e", "")
-    if ed and ed != "TBD":
-        try:
-            res_date = datetime.strptime(ed, "%Y-%m-%d")
-            days_to_res = (res_date - datetime.now()).days
-            if 1 <= days_to_res <= 7:
-                score += 1.5  # Fast resolution, good turnover
-            elif 8 <= days_to_res <= 30:
-                score += 0.5  # Reasonable
-            elif days_to_res > 60:
-                score -= 1.0  # Too far out, capital tied up
-        except:
-            pass  # Can't parse date, no penalty
+    # Markets resolving in 1-7 days = optimal (fast turnover, enough movement)
+    days_to_res = market.get("days_to_res")
+    if days_to_res is not None and days_to_res >= 0:
+        if 1 <= days_to_res <= 3:
+            score += 2.0  # Fast resolution, excellent capital turnover
+        elif 4 <= days_to_res <= 7:
+            score += 1.0  # Still good
+        elif 8 <= days_to_res <= 14:
+            score += 0.0  # Neutral
+        elif days_to_res > 14:
+            score -= 1.0  # Too far out, capital tied up
+    elif ed and ed != "TBD":
+        pass  # Fallback for when days_to_res wasn't pre-computed
     
     return max(0, min(10, round(score, 1)))
 
