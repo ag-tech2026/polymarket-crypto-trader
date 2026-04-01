@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Polymarket Autonomous Agent v3 — self-tuning, zero manual edits."""
-import json, os, subprocess, sys, time
+import json, os, subprocess, sys, time, re
 from datetime import datetime
 from pathlib import Path
 
@@ -35,7 +35,7 @@ def telegram_alert(msg):
     """Send a Telegram alert."""
     if not CFG.get("telegram_alerts", True):
         return
-    token = "8790751627:AAFytj-a3W3OegqSsYNAtjIVenTHKFfR55s"
+    token="879075...R55s"
     chat_id = "7372567737"
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = f"chat_id={chat_id}&text={msg}&parse_mode=HTML"
@@ -51,15 +51,110 @@ def bp(a, t=30):
     try: return json.loads(r.stdout), None
     except: return r.stdout.strip(), None
 
+def _slug_match(slug, text):
+    """Match a market slug against Bullpen display text with fuzzy matching.
+    Handles Bullpen truncation where names like 'December 31' become 'Decemb…'"""
+    text_lower = text.lower().replace("", "").replace(",", "").replace("$", "")
+    slug_words = slug.replace("-"," ").split()
+    sig = [w for w in slug_words if len(w) > 2 and w not in (
+        "will", "the", "and", "for", "with", "reach", "above", "below",
+        "after", "before", "between", "december", "november", "october",
+        "september", "january", "february", "by", "one", "day"
+    )]
+    if not sig:
+        return False
+
+    found = 0
+    for w in sig:
+        if w in text_lower:
+            found += 1
+        elif len(w) > 4:
+            # Truncation: 'december' slug vs 'decemb' in text
+            for t in text_lower.split():
+                clean_t = t.replace("", "")
+                if len(clean_t) >= 4 and (w.startswith(clean_t) or clean_t.startswith(w)):
+                    found += 1
+                    break
+
+    needed = min(2, max(1, len(sig) // 3))
+    if not needed:
+        needed = 1
+    return found >= needed
+
+def check_expired_positions(s):
+    """
+    Auto-free expired/resolved positions stuck in state.
+    
+    Two-pass check:
+    1. State vs Bullpen cross-check — if position is in our state but NOT 
+       listed on Bullpen, it resolved on Polymarket and should be freed.
+    2. Date check — future positions with `e` field past resolution date 
+       get cleaned (secondary safety net).
+    
+    This prevents ghost positions from blocking new trades and
+    giving misleading portfolio metrics.
+    """
+    positions = s.get("pos", {})
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    expired = []
+
+    # Pass 1: State vs Bullpen cross-check
+    # Positions present in state but NOT on Bullpen = resolved, auto-free
+    bull_slugs = []
+    d, e = bp(["positions"])
+    if d and not e:
+        output = str(d).strip()
+        for line in output.split("\n"):
+            for slug_key in list(positions.keys()):
+                if _slug_match(slug_key, line):
+                    bull_slugs.append(slug_key)
+                    break
+
+    for slug in positions:
+        if slug not in bull_slugs:
+            expired.append(slug)
+            log(f"  Not found on Bullpen (resolved): {slug[:50]}")
+
+    # Pass 2: Date check
+    for slug, info in list(positions.items()):
+        if slug in expired:
+            continue
+        ed = info.get("e", "")
+        if not ed or ed == "TBD":
+            continue
+        try:
+            res_date = datetime.strptime(ed[:10], "%Y-%m-%d")
+            if res_date < today:
+                expired.append(slug)
+                log(f"  Past resolution date: {slug[:50]} (resolved {ed})")
+        except:
+            pass
+
+    # Clean up
+    for slug in expired:
+        info = positions.get(slug, {})
+        entry_pnl = round(0 - (info.get("a", 1.0) * info.get("p", 0.5)), 2)
+        meta = {k: v for k, v in info.items() if k in ("o", "p", "a")}
+        l = json.loads(JFILE.read_text()) if JFILE.exists() else []
+        l.append(dict(d=datetime.now().isoformat(), t="expired", s=slug, p=entry_pnl, **meta))
+        if len(l) > 600: l = l[-300:]
+        JFILE.write_text(json.dumps(l, indent=2))
+        positions.pop(slug, None)
+
+    if expired:
+        s["pos"] = positions
+        s["d_pnl"] = 0
+        log(f"  Freed {len(expired)} expired position(s) — slots available")
+
+    return expired
+
 def load():
     if SFILE.exists():
         try:
             raw=json.loads(SFILE.read_text())
-            # Map old keys to new schema
             s={}
             for k,v in CFG.items(): s[k]=raw.get(k,v)
             
-            # Convert positions: old "outcome"/"price"/"amount" → new "o"/"p"/"a"
             raw_pos=raw.get("positions",raw.get("pos",{}))
             s_pos={}
             for sl,info in raw_pos.items():
@@ -132,12 +227,21 @@ def tune(s):
     
     if wr>=0.60:
         s["yes_max"]=round(min(0.55,s.get("yes_max",0.40)+0.05),2)
-        log(f"🎯 WinRate({wr:.0%}): Widening YES to {s['yes_max']:.0%}"); ch=True
+        log(f"  WinRate({wr:.0%}): Widening YES to {s['yes_max']:.0%}"); ch=True
     elif wr<0.40:
         s["yes_max"]=round(max(0.10,s.get("yes_max",0.40)-0.05),2)
-        log(f"📉 WinRate({wr:.0%}): Tightening YES to {s['yes_max']:.0%}"); ch=True
+        log(f"  WinRate({wr:.0%}): Tightening YES to {s['yes_max']:.0%}"); ch=True
         
     if ch: s["last_tune_run"]=s["runs"]
+
+def load_research():
+    rfile = STATE / "research.json"
+    if not rfile.exists(): return {}
+    with open(rfile) as f: return json.load(f)
+
+def load_journal():
+    if not JFILE.exists(): return []
+    with open(JFILE) as f: return json.load(f)
 
 def run(dry=True):
     mode="LIVE" if not dry else "DRY"
@@ -145,16 +249,19 @@ def run(dry=True):
     size=sz(s)
     log("="*60); log(f"[{mode}] #{s['runs']} sz:${size:.2f} YES<={c['yes_max']:.0%}")
 
+    # ── 0. Clean expired positions from state ──
+    check_expired_positions(s)
+    
     # Fast mode: override TP/SL for faster learning
     if c.get("fast_mode"):
         orig_tp=c["tp_roi"]; orig_sl=c["sl_pct"]
         c["tp_roi"]=0.50; c["sl_pct"]=0.30
-        log(f"⚡ Fast mode: TP={c['tp_roi']:.0%} SL={c['sl_pct']:.0%}")
+        log(f"  Fast mode: TP={c['tp_roi']:.0%} SL={c['sl_pct']:.0%}")
     
-    # Resolution window filter (default: 1-7 days)
+    # Resolution window filter
     min_days = c.get("min_resolution_days", 1)
     max_days = c.get("max_resolution_days", 7)
-    log(f"📅 Resolution window: {min_days}-{max_days}d from now")
+    log(f"  Resolution window: {min_days}-{max_days}d from now")
     
     # 1. Safety Check
     bal=None; d,e=bp(["clob","balance"])
@@ -164,10 +271,10 @@ def run(dry=True):
                 try: bal=float(l.split("$")[1].split(",")[0]); break
                 except: pass
     if bal is not None:
-        log(f"💰${bal:.2f} | Day:${s['d_pnl']:+.2f} | Tot:${s['t_pnl']:+.2f}")
-        if bal<c["cap"]: log("🛑 Balance below cap","CRIT"); save(s); return
-        if s["d_pnl"]<=-c["daily_lim"]: log("🛑 Daily limit hit","CRIT"); save(s); return
-    else: log("⚠️ Balance check failed"); save(s); return
+        log(f"  ${bal:.2f} | Day:${s['d_pnl']:+.2f} | Tot:${s['t_pnl']:+.2f}")
+        if bal<c["cap"]: log("  Balance below cap","CRIT"); save(s); return
+        if s["d_pnl"]<=-c["daily_lim"]: log("  Daily limit hit","CRIT"); save(s); return
+    else: log("  Balance check failed"); save(s); return
 
     # 2. Manage Exits
     rp=[]; d2,e2=bp(["positions"])
@@ -180,22 +287,18 @@ def run(dry=True):
                         except: pass
     
     def _match_pos(slug, text):
-      import re as _re
-      text_clean = text.lower()
-      text_clean = _re.sub(r"[$,\.]", "", text_clean)
-      slug_parts = slug.replace("-"," ").split()
-      sig = [w for w in slug_parts if len(w)>2 and w not in ("will","the","and","for","with","reach","above","below","after","before","between","december","november","october","september","january","february","by")]
-      if not sig:
-        return False
-      words_found = 0
-      for w in sig:
-        if w in text_clean or (w.isdigit() and len(w)>3 and str(int(w)) in text_clean):
-          words_found += 1
-      # Threshold: 2 for short slugs (3-6 sig words), 3 for longer ones
-      # This handles Bullpen's ~40-char truncation cutting off year endings
-      needed = min(3, max(2, (len(sig) + 1) // 3))
-      return words_found >= needed
-
+        text_clean = text.lower()
+        text_clean = re.sub(r"[$,\.,…]", "", text_clean)
+        slug_parts = slug.replace("-"," ").split()
+        sig = [w for w in slug_parts if len(w)>2 and w not in ("will","the","and","for","with","reach","above","below","after","before","between","december","november","october","september","january","february","by")]
+        if not sig:
+            return False
+        words_found = 0
+        for w in sig:
+            if w in text_clean or (w.isdigit() and len(w)>3 and str(int(w)) in text_clean):
+                words_found += 1
+        needed = min(3, max(2, (len(sig) + 1) // 3))
+        return words_found >= needed
 
     for sl in list(s["pos"].keys()):
         info=s["pos"][sl]; entry=info["p"]*info["a"]
@@ -203,7 +306,7 @@ def run(dry=True):
         for x in rp:
             if _match_pos(sl, x["r"]): match=x; break
         if not match:
-            log(f"⏳ Pending (unmatched): {sl[:40]}"); continue
+            log(f"  Pending (unmatched): {sl[:40]}"); continue
             
         pnl=(entry*(1+match["pnl"]/100))-entry; roi=pnl/entry if entry>0 else 0
         
@@ -212,25 +315,25 @@ def run(dry=True):
             s["t_pnl"]+=pnl; s["d_pnl"]+=pnl
             meta={k:v for k,v in info.items() if k in("cat","pr","e","liq","vol") and v}
             jlog("tp",sl,pnl, **meta); s["pos"].pop(sl)
-            log(f"💰 TP: {sl[:30]} ROI={roi:.0%} ${pnl:+.2f}")
-            msg = f"💰 TP hit: {sl[:40]}\nROI: {roi:.0%} | P&L: ${pnl:+.2f}\nRun #{s['runs']}"
+            log(f"  TP: {sl[:30]} ROI={roi:.0%} ${pnl:+.2f}")
+            msg = f" TP hit: {sl[:40]}\nROI: {roi:.0%} | P&L: ${pnl:+.2f}\nRun #{s['runs']}"
             if c.get("telegram_alerts"): telegram_alert(msg)
         elif roi<=-c["sl_pct"]:
             if not dry: bp(["sell",sl,info["o"],f"{info['a']:.2f}","--yes"])
             s["t_pnl"]+=pnl; s["d_pnl"]+=pnl
             meta={k:v for k,v in info.items() if k in("cat","pr","e","liq","vol") and v}
             jlog("sl",sl,pnl, **meta); s["pos"].pop(sl)
-            log(f"🛑 SL: {sl[:30]} ROI={roi:.0%} ${pnl:+.2f}")
-            msg = f"🛑 SL hit: {sl[:40]}\nROI: {roi:.0%} | P&L: ${pnl:+.2f}\nRun #{s['runs']}"
+            log(f"  SL: {sl[:30]} ROI={roi:.0%} ${pnl:+.2f}")
+            msg = f" SL hit: {sl[:40]}\nROI: {roi:.0%} | P&L: ${pnl:+.2f}\nRun #{s['runs']}"
             if c.get("telegram_alerts"): telegram_alert(msg)
 
     # 3. Self-Tune
     tune(s)
 
-    # 3b. Research (every 5 runs, or on --research flag)
+    # 3b. Research (every 5 runs)
     if s["runs"] % 5 == 0 or "--research" in sys.argv:
         try:
-            log("🔬 Running research analysis...")
+            log("  Running research analysis...")
             import importlib.util
             spec = importlib.util.spec_from_file_location("research", ROOT / "research.py")
             research_mod = importlib.util.module_from_spec(spec)
@@ -241,12 +344,12 @@ def run(dry=True):
                 for rec in r["recommendations"]:
                     log(f"  {rec}", "RESEARCH")
         except Exception as e:
-            log(f"⚠️ Research failed: {e}", "WARN")
+            log(f"  Research failed: {e}", "WARN")
 
-    # 3c. Backtest (every 15 runs, or on --backtest flag)
+    # 3c. Backtest (every 15 runs)
     if s["runs"] % 15 == 0 or "--backtest" in sys.argv:
         try:
-            log("📊 Running backtest comparison...")
+            log("  Running backtest comparison...")
             import importlib.util
             spec = importlib.util.spec_from_file_location("backtest", ROOT / "backtest.py")
             backtest_mod = importlib.util.module_from_spec(spec)
@@ -256,11 +359,11 @@ def run(dry=True):
                 best = max(results, key=lambda x: x["projected_pnl"])
                 current = results[0]
                 if best["projected_pnl"] > current["projected_pnl"] * 1.2:
-                    log(f"🎯 Backtest suggests: {best['name']} (${best['projected_pnl']:+.2f} vs ${current['projected_pnl']:+.2f})", "BACKTEST")
+                    log(f"  Backtest suggests: {best['name']} (${best['projected_pnl']:+.2f} vs ${current['projected_pnl']:+.2f})", "BACKTEST")
                 else:
-                    log("✅ Backtest: current config is competitive", "BACKTEST")
+                    log("  Backtest: current config is competitive", "BACKTEST")
         except Exception as e:
-            log(f"⚠️ Backtest failed: {e}", "WARN")
+            log(f"  Backtest failed: {e}", "WARN")
 
     # 4. Discover & Score
     mkts=[]
@@ -285,16 +388,13 @@ def run(dry=True):
                     cat=_categorize(ev.get("title","")+mk.get("question",""))
                     ed=ev.get("end_date","")
                     
-                    # Resolution timeframe filter
                     days_to_res = None
                     if ed:
                         try:
-                            from datetime import datetime
                             res_dt = datetime.strptime(ed[:10], "%Y-%m-%d")
                             days_to_res = (res_dt - datetime.now()).days
                         except: pass
                     
-                    # Skip if outside resolution window
                     if days_to_res is not None:
                         if days_to_res < min_days or days_to_res > max_days:
                             continue
@@ -311,7 +411,6 @@ def run(dry=True):
                     days_to_res = None
                     if ed:
                         try:
-                            from datetime import datetime
                             res_dt = datetime.strptime(ed[:10], "%Y-%m-%d")
                             days_to_res = (res_dt - datetime.now()).days
                         except: pass
@@ -327,26 +426,16 @@ def run(dry=True):
     
     mkts.sort(key=lambda x:-x["r"])
     
-    # 4b. Ensemble Scoring — 4-pillar confidence system
+    # 4b. Ensemble Scoring
     try:
         import importlib.util
         spec = importlib.util.spec_from_file_location("ensemble_scoring", ROOT / "ensemble_scoring.py")
         ensemble = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(ensemble)
         
-        rdata = None
-        try:
-            rdata = load_research()
-        except:
-            pass
+        rdata = load_research()
+        jdata = load_journal()
         
-        jdata = None
-        try:
-            jdata = load_journal()
-        except:
-            pass
-        
-        # Score each discovered market
         scored_markets = []
         for m in mkts:
             sr = ensemble.score_market(m, s, research=rdata, journal=jdata)
@@ -355,34 +444,30 @@ def run(dry=True):
             m["ensemble_pillars"] = sr
             scored_markets.append(m)
         
-        # Filter: skip markets with ensemble score < 25
         before = len(scored_markets)
         scored_markets = [m for m in scored_markets if m.get("ensemble_total", 0) >= 25]
         skipped = before - len(scored_markets)
-        log(f"🎯 Ensemble filter: {before} → {len(scored_markets)} (skipped {skipped} low-confidence)")
+        log(f"  Ensemble filter: {before} -> {len(scored_markets)} (skipped {skipped})")
         
-        # Log top 3 scored markets for transparency
         for i, m in enumerate(scored_markets[:3]):
             ep = m["ensemble_pillars"]
             log(f"  #{i+1} [{m['ensemble_conviction']}] {m['s'][:35]} | Score: {m['ensemble_total']:.1f} | "
                 f"S={ep['sentiment']} E={ep['historical_edge']} M={ep['market_dynamics']} P={ep['portfolio_health']}")
     
     except Exception as e:
-        log(f"⚠️ Ensemble scoring failed: {e}, falling back to ROI sorting", "WARN")
+        log(f"  Ensemble scoring failed: {e}, falling back to ROI", "WARN")
         scored_markets = [dict(m, ensemble_total=m["r"]*10, ensemble_conviction="MEDIUM",
                                ensemble_pillars={}) for m in mkts]
     
     ex=set(s["pos"].keys())
     av=[m for m in scored_markets if m["s"] not in ex]
-    # Sort by ensemble score (descending), then ROI as tiebreaker
     av.sort(key=lambda x: (-x.get("ensemble_total", 0), -x["r"]))
-    log(f"👁️ Scanned {len(mkts)}, Found {len(av)} opportunities (ensemble-filtered)")
+    log(f"  Scanned {len(mkts)}, Found {len(av)} opportunities")
     
-    # 5. Execute with correlation limits
+    # 5. Execute
     slots=c["max_pos"]-len(s["pos"])
     max_per_cat = c.get("max_per_category", 2)
     
-    # Count current positions per category
     cat_counts = {}
     for sl, info in s["pos"].items():
         cat = info.get("cat", "crypto")
@@ -391,42 +476,39 @@ def run(dry=True):
     filled = 0
     for m in av[:slots]:
         cat = m.get("cat", "crypto")
-        # Correlation limit check
         if cat_counts.get(cat, 0) >= max_per_cat:
-            log(f"⏭️ Skip {m['s'][:30]}: {cat} cap reached ({cat_counts[cat]}/{max_per_cat})")
+            log(f"  Skip {m['s'][:30]}: {cat} cap ({cat_counts[cat]}/{max_per_cat})")
             continue
         
         a=sz(s); q_short=m['q'][:30].replace('"','')
         meta = {
-            "cat": m.get("cat", "crypto"),     # market category
-            "e": m.get("e", ""),                # end date/timeframe
-            "liq": m.get("liq", 0),             # liquidity
-            "vol": m.get("vol", 0),             # volume
-            "pr": m.get("pr", ""),              # price bucket
+            "cat": m.get("cat", "crypto"),
+            "e": m.get("e", ""),
+            "liq": m.get("liq", 0),
+            "vol": m.get("vol", 0),
+            "pr": m.get("pr", ""),
         }
         if not dry:
             d_r,err=bp(["buy",m["s"],m["o"],f"{a:.2f}","--yes","--output","json"])
             if err: 
-                log(f"❌ Buy failed: {err}","WARN")
+                log(f"  Buy failed: {err}","WARN")
             else:
                 s["pos"][m["s"]]=dict(o=m["o"],p=m["p"],a=a, **{k:v for k,v in meta.items() if v})
                 jlog("open",m["s"],0, **{k:v for k,v in meta.items() if v})
-                log(f"✅ LIVE {m['o']}@{m['p']:.0%} ${a:.2f} → {q_short}")
+                log(f"  LIVE {m['o']}@{m['p']:.0%} ${a:.2f} -> {q_short}")
                 filled += 1
                 cat_counts[cat] = cat_counts.get(cat, 0) + 1
         else:
-            # DRY: log opportunity but don't persist to state (prevents zombie positions)
             jlog("dry_open",m["s"],0, **{k:v for k,v in meta.items() if v})
-            log(f"✅ DRY {m['o']}@{m['p']:.0%} ${a:.2f} → {q_short}")
+            log(f"  DRY {m['o']}@{m['p']:.0%} ${a:.2f} -> {q_short}")
             filled += 1
             cat_counts[cat] = cat_counts.get(cat, 0) + 1
             
-    log(f"📊 {len(s['pos'])}/{c['max_pos']} pos | ${s['t_pnl']:+.2f} | Filled {filled} trades")
+    log(f"  {len(s['pos'])}/{c['max_pos']} pos | ${s['t_pnl']:+.2f} | Filled {filled}")
     log("="*60); save(s)
 
 if __name__=="__main__": 
     if "--research" in sys.argv:
-        # Run research standalone
         import importlib.util
         spec = importlib.util.spec_from_file_location("research", ROOT / "research.py")
         research_mod = importlib.util.module_from_spec(spec)
@@ -435,7 +517,6 @@ if __name__=="__main__":
         research_mod.save_research(r)
         research_mod.print_report(r)
     elif "--backtest" in sys.argv:
-        # Run backtest standalone
         import importlib.util
         spec = importlib.util.spec_from_file_location("backtest", ROOT / "backtest.py")
         backtest_mod = importlib.util.module_from_spec(spec)
