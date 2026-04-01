@@ -3,3 +3,4 @@ data/trade-journal/*.csv
 data/data/
 __pycache__/
 *.pyc
+state/research/backtests/*.json

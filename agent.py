@@ -191,6 +191,25 @@ def run(dry=True):
         except Exception as e:
             log(f"⚠️ Research failed: {e}", "WARN")
 
+    # 3c. Backtest (every 15 runs, or on --backtest flag)
+    if s["runs"] % 15 == 0 or "--backtest" in sys.argv:
+        try:
+            log("📊 Running backtest comparison...")
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("backtest", ROOT / "backtest.py")
+            backtest_mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(backtest_mod)
+            results = backtest_mod.run_backtest(json_output=True)
+            if results:
+                best = max(results, key=lambda x: x["projected_pnl"])
+                current = results[0]
+                if best["projected_pnl"] > current["projected_pnl"] * 1.2:
+                    log(f"🎯 Backtest suggests: {best['name']} (${best['projected_pnl']:+.2f} vs ${current['projected_pnl']:+.2f})", "BACKTEST")
+                else:
+                    log("✅ Backtest: current config is competitive", "BACKTEST")
+        except Exception as e:
+            log(f"⚠️ Backtest failed: {e}", "WARN")
+
     # 4. Discover & Score
     mkts=[]
     scopes = ["crypto"]
@@ -266,6 +285,13 @@ if __name__=="__main__":
         r = research_mod.analyze()
         research_mod.save_research(r)
         research_mod.print_report(r)
+    elif "--backtest" in sys.argv:
+        # Run backtest standalone
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("backtest", ROOT / "backtest.py")
+        backtest_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(backtest_mod)
+        backtest_mod.run_backtest()
     elif "--live" in sys.argv:
         run(dry=False)
     else:
